@@ -5,7 +5,6 @@ import signal
 import sys
 import threading
 import uuid
-from contextlib import contextmanager
 from time import sleep
 
 import Ice
@@ -13,7 +12,7 @@ from Ice import identityToString as id2str
 
 from gst_player import GstPlayer
 
-Ice.loadSlice(f'-I{Ice.getSliceDir()} spotifice_v0.ice')
+Ice.loadSlice(f'-I{Ice.getSliceDir()} spotifice_v1.ice')
 import Spotifice  # type: ignore # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
@@ -25,14 +24,71 @@ class MediaRenderI(Spotifice.MediaRender):
         self.player = player
         self.provider = None
         self.current_track = None
-
-    def ensure_player_stopped(self):
-        if self.player.is_playing():
-            raise Spotifice.PlayerError(reason="Already playing")
+        self.render_id = None
+        self.history = []
+        self.repeat = False
+        self.state = Spotifice.PlaybackState.STOPPED
 
     def ensure_provider_bound(self):
         if not self.provider:
             raise Spotifice.BadReference(reason="No MediaProvider bound")
+
+    # --- stream lifecycle ---
+
+    def open_and_play(self, render_id):
+        try:
+            self.provider.open_stream(render_id, self.current_track.id)
+        except Spotifice.BadIdentity as e:
+            logger.error(f"Error starting stream: {e.reason}")
+            raise Spotifice.StreamError(reason="Stream setup failed")
+
+        self.render_id = render_id
+        self.player.play(self.chunk_reader(render_id),
+                         self.exhausted_handler(render_id))
+
+        if not self.player.confirm_play_starts():
+            raise Spotifice.PlayerError(reason="Failed to confirm playback")
+
+        self.state = Spotifice.PlaybackState.PLAYING
+
+    def exhausted_handler(self, render_id):
+        def on_track_exhausted():
+            if not self.repeat:
+                self.state = Spotifice.PlaybackState.STOPPED
+                return
+
+            logger.info(f"Repeating track '{self.current_track.id}'")
+            try:
+                self.open_and_play(render_id)
+            except Ice.Exception as e:
+                logger.error(f"Error repeating track: {e}")
+                self.state = Spotifice.PlaybackState.STOPPED
+
+        return on_track_exhausted
+
+    def teardown_playback(self):
+        if self.provider and self.render_id:
+            try:
+                self.provider.close_stream(self.render_id)
+            except Ice.Exception as e:
+                logger.error(f"Error closing stream: {e}")
+
+        if not self.player.stop():
+            raise Spotifice.PlayerError(reason="Failed to confirm stop")
+
+    def switch_track(self, track):
+        previous_state = self.state
+
+        if previous_state != Spotifice.PlaybackState.STOPPED:
+            self.teardown_playback()
+
+        self.current_track = track
+        logger.info(f"Current track set to: {track.title}")
+
+        if previous_state == Spotifice.PlaybackState.PLAYING:
+            self.open_and_play(self.render_id)
+        else:
+            self.state = previous_state
 
     # --- RenderConnectivity ---
 
@@ -44,6 +100,7 @@ class MediaRenderI(Spotifice.MediaRender):
             raise Spotifice.BadReference(reason=f"MediaProvider not reachable: {e}")
 
         self.provider = media_provider
+        self.history.clear()
         logger.info(f"Bound to MediaProvider '{id2str(media_provider.ice_getIdentity())}'")
 
     def unbind_media_provider(self, current=None):
@@ -53,6 +110,7 @@ class MediaRenderI(Spotifice.MediaRender):
             logger.error(f"Unbinding despite stop failure: {e.reason}")
 
         self.provider = None
+        self.history.clear()
         logger.info("Unbound MediaProvider")
 
     # --- ContentManager ---
@@ -61,30 +119,22 @@ class MediaRenderI(Spotifice.MediaRender):
         self.ensure_provider_bound()
 
         try:
-            with self.keep_playing_state(current):
-                self.current_track = self.provider.get_track_info(track_id)
-
-            logger.info(f"Current track set to: {self.current_track.title}")
-
+            track = self.provider.get_track_info(track_id)
         except Spotifice.TrackError as e:
             logger.error(f"Error setting track: {e.reason}")
             raise
+
+        if self.current_track and track.id == self.current_track.id:
+            logger.info(f"Track already loaded: {track.title}")
+            return
+
+        self.switch_track(track)
+        self.history.append(track.id)
 
     def get_current_track(self, current=None):
         return self.current_track
 
     # --- PlaybackController ---
-
-    @contextmanager
-    def keep_playing_state(self, current):
-        playing = self.player.is_playing()
-        if playing:
-            self.stop(current)
-        try:
-            yield
-        finally:
-            if playing:
-                self.play(current)
 
     def play(self, current=None):
         assert current, "remote invocation required"
@@ -94,17 +144,65 @@ class MediaRenderI(Spotifice.MediaRender):
         if not self.current_track:
             raise Spotifice.TrackError(reason="No track loaded")
 
-        self.ensure_player_stopped()
+        if self.state == Spotifice.PlaybackState.PLAYING:
+            raise Spotifice.PlayerError(reason="Already playing")
+
+        if self.state == Spotifice.PlaybackState.PAUSED and self.player.is_playing():
+            if not self.player.resume():
+                raise Spotifice.PlayerError(reason="Failed to resume playback")
+
+            self.state = Spotifice.PlaybackState.PLAYING
+            logger.info("Resumed")
+            return
+
+        self.open_and_play(current.id)
+
+    def pause(self, current=None):
+        if self.state == Spotifice.PlaybackState.STOPPED:
+            raise Spotifice.PlayerError(reason="Cannot pause when stopped")
+
+        if self.state == Spotifice.PlaybackState.PAUSED:
+            return
+
+        if not self.player.pause():
+            raise Spotifice.PlayerError(reason="Failed to confirm pause")
+
+        self.state = Spotifice.PlaybackState.PAUSED
+        logger.info("Paused")
+
+    def stop(self, current=None):
+        if self.state == Spotifice.PlaybackState.STOPPED:
+            return
+
+        self.teardown_playback()
+        self.state = Spotifice.PlaybackState.STOPPED
+        logger.info("Stopped")
+
+    def previous(self, current=None):
+        if len(self.history) < 2:
+            logger.info("No previous track to go back to")
+            return
+
+        self.ensure_provider_bound()
 
         try:
-            self.provider.open_stream(current.id, self.current_track.id)
-        except Spotifice.BadIdentity as e:
-            logger.error(f"Error starting stream: {e.reason}")
-            raise Spotifice.StreamError(reason="Strean setup failed")
+            track = self.provider.get_track_info(self.history[-2])
+        except Spotifice.TrackError as e:
+            logger.error(f"Error going back to previous track: {e.reason}")
+            raise
 
-        self.player.play(self.chunk_reader(current.id))
-        if not self.player.confirm_play_starts():
-            raise Spotifice.PlayerError(reason="Failed to confirm playback")
+        self.switch_track(track)
+        self.history.pop()
+
+    def get_status(self, current=None):
+        return Spotifice.PlaybackStatus(
+            state=self.state,
+            current_track=self.current_track,
+            is_repeating=self.repeat)
+
+    def set_repeat(self, enabled, current=None):
+        self.repeat = enabled
+        logger.info(f"Repeat {'enabled' if enabled else 'disabled'}")
 
     def chunk_reader(self, render_id):
         provider = self.provider
@@ -118,15 +216,6 @@ class MediaRenderI(Spotifice.MediaRender):
                 logger.critical(e)
 
         return read_chunk
-
-    def stop(self, current=None):
-        if self.provider and current:
-            self.provider.close_stream(current.id)
-
-        if not self.player.stop():
-            raise Spotifice.PlayerError(reason="Failed to confirm stop")
-
-        logger.info("Stopped")
 
 
 def shutdown_on_interrupt(ic):
